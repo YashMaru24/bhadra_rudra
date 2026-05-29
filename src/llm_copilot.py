@@ -3,14 +3,30 @@ LLM Copilot — AI-powered investigation assistant.
 Uses Gemini API with tool-calling to answer investigator queries
 over the live fund flow graph.
 
+
 Tools: trace_funds(), find_cycles(), explain_alert(), get_profile_delta()
 """
+""" Summary
+- Added lightweight conversation context for follow-up queries
+- Added fuzzy entity matching using RapidFuzz
+
+Changes
+- Store last referenced entity and alert
+- Support follow-up prompts such as:
+  - "Check profile for that entity"
+  - "Explain that alert"
+- Replace exact/partial matching with fuzzy matching to handle typos
+
+Examples
+- "Trace funds for Apex Tradng" now resolves correctly
+- Follow-up investigations can reference the previously selected entity or alert"""
 
 import json
 import os
 from typing import Dict, List, Optional, Any
 import pandas as pd
 import networkx as nx
+from rapidfuzz import process
 
 
 class LLMCopilot:
@@ -32,6 +48,10 @@ class LLMCopilot:
         self.model_bundle = model_bundle
         self.conversation_history: List[Dict] = []
         self.tool_results_log: List[Dict] = []
+        self.context = {
+           "last_entity": None,
+           "last_alert": None
+          }
 
     # ── Tool Definitions ──────────────────────────────────────
 
@@ -71,7 +91,7 @@ class LLMCopilot:
             "num_sources": len(set(f["from"] for f in result["flows"]["incoming"])),
             "num_destinations": len(set(f["to"] for f in result["flows"]["outgoing"])),
         }
-
+        self.context["last_entity"] = node_data.get("name", entity_name)
         return result
 
     def find_cycles(self, entity_name: Optional[str] = None,
@@ -240,7 +260,7 @@ class LLMCopilot:
         for case in self.fraud_cases:
             if set(case.get("entities", [])) & entity_ids:
                 explanation["related_cases"].append(case)
-
+        self.context["last_alert"] = alert_id
         return explanation
 
     def get_profile_delta(self, entity_name: str) -> Dict:
@@ -547,7 +567,17 @@ class LLMCopilot:
     def _generate_local_response(self, user_message: str) -> str:
         """Generate response using local tool execution and template-based answers."""
         msg = user_message.lower()
+        if "that entity" in msg or "same entity" in msg:
+            entity = self.context.get("last_entity")
+            if entity:
+                result = self.get_profile_delta(entity)
+                return self._format_profile_response(entity, result)
 
+        if "that alert" in msg or "same alert" in msg:
+            alert_id = self.context.get("last_alert")
+            if alert_id:
+                result = self.explain_alert(alert_id)
+                return self._format_explain_response(result)
         # Route to appropriate tool based on intent
         if any(kw in msg for kw in ["trace", "flow", "follow", "track", "where did", "money go"]):
             entity = self._extract_entity_name(user_message)
@@ -595,18 +625,30 @@ class LLMCopilot:
     # ── Helper Methods ────────────────────────────────────────
 
     def _find_node(self, name: str) -> Optional[str]:
-        """Find a node by name (case-insensitive partial match)."""
         if not name:
             return None
-        name_lower = name.lower().strip()
+
+        all_nodes = []
+
         for node in self.graph.nodes():
             node_name = self.graph.nodes[node].get("name", "")
-            if name_lower == node_name.lower():
-                return node
-        for node in self.graph.nodes():
-            node_name = self.graph.nodes[node].get("name", "")
-            if name_lower in node_name.lower():
-                return node
+            all_nodes.append((node_name, node))
+
+        names = [x[0] for x in all_nodes]
+    
+        matches = process.extract(
+            name,
+            names,
+            limit=3
+        )
+    
+        if matches and matches[0][1] >= 80:
+            best_name = matches[0][0]
+
+            for node_name, node_id in all_nodes:
+                if node_name == best_name:
+                    return node_id
+    
         return None
 
     def _trace_direction(self, node_id: str, direction: str, depth: int) -> List[Dict]:
